@@ -75,12 +75,40 @@ interface CollaborativeUser {
   lastSeen: number
 }
 
-export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: DocumentEditorProps) {
+// Add retry utility function
+const retryWithBackoff = async (fn: () => Promise<any>, maxRetries = 3, baseDelay = 1000) => {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error: any) {
+      // If it's a rate limit error, wait for the specified time
+      if (error?.details?.code === 'RATE_LIMIT_EXCEEDED') {
+        const resetTime = new Date(error.details.reset).getTime()
+        const currentTime = Date.now()
+        const waitTime = Math.max(resetTime - currentTime, baseDelay * Math.pow(2, attempt))
+        
+        console.log(`Rate limited. Waiting ${waitTime}ms before retry ${attempt + 1}/${maxRetries}`)
+        
+        if (attempt < maxRetries - 1) {
+          await new Promise(resolve => setTimeout(resolve, waitTime))
+          continue
+        }
+      }
+      
+      // For non-rate-limit errors or final attempt, throw the error
+      throw error
+    }
+  }
+}
+
+export default function DocumentEditor({ documentId = 'doc-main-document' }: DocumentEditorProps) {
   const [documentTitle, setDocumentTitle] = useState('Untitled document')
   const [documentContent, setDocumentContent] = useState('')
   const [isEditing, setIsEditing] = useState(false)
   const [user, setUser] = useState<any>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [isLoadingDocument, setIsLoadingDocument] = useState(false)
+  const [isLoadingComments, setIsLoadingComments] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [lastSaved, setLastSaved] = useState<Date | null>(null)
   const [collaborators, setCollaborators] = useState<CollaborativeUser[]>([])
@@ -89,10 +117,14 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
   const [isShareDialogOpen, setIsShareDialogOpen] = useState(false)
   const [shareEmail, setShareEmail] = useState('')
   const [sharePermission, setSharePermission] = useState<'view' | 'edit'>('view')
+  const [error, setError] = useState<string | null>(null)
 
   const editorRef = useRef<HTMLDivElement>(null)
   const titleRef = useRef<HTMLInputElement>(null)
   const saveTimeoutRef = useRef<NodeJS.Timeout>()
+  const loadDocumentTimeoutRef = useRef<NodeJS.Timeout>()
+  const hasLoadedDocument = useRef(false)
+  const hasLoadedComments = useRef(false)
 
   // Font families and sizes
   const fontFamilies = [
@@ -124,18 +156,25 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
     return unsubscribe
   }, [])
 
-  // Load document data
+  // Load document data with retry logic and caching
   useEffect(() => {
-    if (user && documentId) {
-      loadDocument()
-      loadComments()
-      setupRealtime()
+    if (user && documentId && !hasLoadedDocument.current) {
+      // Debounce document loading
+      if (loadDocumentTimeoutRef.current) {
+        clearTimeout(loadDocumentTimeoutRef.current)
+      }
+      
+      loadDocumentTimeoutRef.current = setTimeout(() => {
+        loadDocument()
+        loadComments()
+        setupRealtime()
+      }, 300) // 300ms debounce
     }
   }, [user, documentId])
 
   // Auto-save document content
   useEffect(() => {
-    if (user && documentContent && !isLoading) {
+    if (user && documentContent && !isLoading && hasLoadedDocument.current) {
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current)
       }
@@ -146,33 +185,63 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
   }, [documentContent, user, isLoading])
 
   const loadDocument = async () => {
+    if (isLoadingDocument || hasLoadedDocument.current) return
+    
+    setIsLoadingDocument(true)
+    setError(null)
+    
     try {
-      const docs = await blink.db.documents.list({
-        where: { id: documentId },
-        limit: 1
+      const result = await retryWithBackoff(async () => {
+        return await blink.db.documents.list({
+          where: { id: documentId },
+          limit: 1
+        })
       })
-      if (docs.length > 0) {
-        const doc = docs[0]
+      
+      if (result.length > 0) {
+        const doc = result[0]
         setDocumentTitle(doc.title || 'Untitled document')
         setDocumentContent(doc.content || '')
         if (editorRef.current) {
           editorRef.current.innerHTML = doc.content || '<div>Start typing your document...</div>'
         }
       }
-    } catch (error) {
+      hasLoadedDocument.current = true
+    } catch (error: any) {
       console.error('Failed to load document:', error)
+      if (error?.details?.code === 'RATE_LIMIT_EXCEEDED') {
+        setError(`Rate limited. Please wait ${Math.ceil((new Date(error.details.reset).getTime() - Date.now()) / 1000)} seconds.`)
+      } else {
+        setError('Failed to load document. Please try again.')
+      }
+    } finally {
+      setIsLoadingDocument(false)
     }
   }
 
   const loadComments = async () => {
+    if (isLoadingComments || hasLoadedComments.current) return
+    
+    setIsLoadingComments(true)
+    
     try {
-      const commentsList = await blink.db.documentComments.list({
-        where: { documentId: documentId },
-        orderBy: { createdAt: 'desc' }
+      const result = await retryWithBackoff(async () => {
+        return await blink.db.documentComments.list({
+          where: { documentId: documentId },
+          orderBy: { createdAt: 'desc' }
+        })
       })
-      setComments(commentsList)
-    } catch (error) {
+      
+      setComments(result)
+      hasLoadedComments.current = true
+    } catch (error: any) {
       console.error('Failed to load comments:', error)
+      if (error?.details?.code !== 'RATE_LIMIT_EXCEEDED') {
+        // Don't show error for rate limits in comments as it's not critical
+        setError('Failed to load comments.')
+      }
+    } finally {
+      setIsLoadingComments(false)
     }
   }
 
@@ -241,13 +310,16 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
     
     setIsSaving(true)
     try {
-      await blink.db.documents.upsert({
-        id: documentId,
-        title: documentTitle,
-        content: documentContent,
-        userId: user.id,
-        updatedAt: new Date()
+      await retryWithBackoff(async () => {
+        return await blink.db.documents.upsert({
+          id: documentId,
+          title: documentTitle,
+          content: documentContent,
+          userId: user.id,
+          updatedAt: new Date()
+        })
       })
+      
       setLastSaved(new Date())
 
       // Broadcast content update to other users
@@ -271,11 +343,13 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
     setIsEditing(false)
     if (user) {
       try {
-        await blink.db.documents.upsert({
-          id: documentId,
-          title: documentTitle,
-          userId: user.id,
-          updatedAt: new Date()
+        await retryWithBackoff(async () => {
+          return await blink.db.documents.upsert({
+            id: documentId,
+            title: documentTitle,
+            userId: user.id,
+            updatedAt: new Date()
+          })
         })
 
         // Broadcast title update
@@ -336,7 +410,10 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
         resolved: false
       }
 
-      await blink.db.documentComments.create(comment)
+      await retryWithBackoff(async () => {
+        return await blink.db.documentComments.create(comment)
+      })
+      
       setComments(prev => [{ ...comment, user: { email: user.email } }, ...prev])
 
       // Broadcast new comment
@@ -354,11 +431,13 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
     if (!shareEmail || !user) return
 
     try {
-      await blink.db.documentCollaborators.create({
-        id: 'collab-' + Date.now(),
-        documentId,
-        userId: shareEmail, // In real app, this would be resolved to actual user ID
-        permission: sharePermission
+      await retryWithBackoff(async () => {
+        return await blink.db.documentCollaborators.create({
+          id: 'collab-' + Date.now(),
+          documentId,
+          userId: shareEmail, // In real app, this would be resolved to actual user ID
+          permission: sharePermission
+        })
       })
 
       setShareEmail('')
@@ -367,6 +446,32 @@ export default function DocumentEditor({ documentId = 'doc-' + Date.now() }: Doc
     } catch (error) {
       console.error('Failed to share document:', error)
     }
+  }
+
+  if (error) {
+    return (
+      <div className="h-screen bg-[#f9fbfd] flex items-center justify-center w-full">
+        <div className="text-center">
+          <div className="w-16 h-16 bg-[#1a73e8] rounded-lg flex items-center justify-center mx-auto mb-4">
+            <span className="text-white text-2xl font-bold">D</span>
+          </div>
+          <h2 className="text-2xl font-normal text-gray-900 mb-2">Rate Limited</h2>
+          <p className="text-gray-600 mb-4">{error}</p>
+          <Button 
+            onClick={() => {
+              setError(null)
+              hasLoadedDocument.current = false
+              hasLoadedComments.current = false
+              loadDocument()
+              loadComments()
+            }} 
+            className="bg-[#1a73e8] hover:bg-[#1557b0]"
+          >
+            Try Again
+          </Button>
+        </div>
+      </div>
+    )
   }
 
   if (isLoading) {
