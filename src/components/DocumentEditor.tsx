@@ -84,7 +84,7 @@ export default function DocumentEditor({ documentId = 'untitled' }: DocumentEdit
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-[#f9fbfd] flex items-center justify-center">
+      <div className="h-screen bg-[#f9fbfd] flex items-center justify-center w-full">
         <div className="text-center">
           <div className="w-16 h-16 bg-[#1a73e8] rounded-lg flex items-center justify-center mx-auto mb-4">
             <span className="text-white text-2xl font-bold">D</span>
@@ -97,7 +97,7 @@ export default function DocumentEditor({ documentId = 'untitled' }: DocumentEdit
   }
 
   return (
-    <div className="min-h-screen bg-[#f9fbfd] flex flex-col">
+    <div className="h-screen bg-[#f9fbfd] flex flex-col w-full">
       {/* Header */}
       <header className="bg-white border-b border-gray-200 flex-shrink-0">
         <div className="px-6 py-3">
